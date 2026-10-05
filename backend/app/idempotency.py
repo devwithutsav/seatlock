@@ -1,24 +1,20 @@
-from datetime import datetime, timezone
-
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import IdempotencyKey, User
+from .models import IdempotencyKey
 
 
 async def get_existing_idempotency_key(
     db: AsyncSession,
-    *,
     key: str,
-    user: User,
+    user_id: int,
     operation: str,
-) -> IdempotencyKey | None:
-
+):
 
     result = await db.execute(
         select(IdempotencyKey).where(
             IdempotencyKey.key == key,
-            IdempotencyKey.user_id == user.id,
+            IdempotencyKey.user_id == user_id,
             IdempotencyKey.operation == operation,
         )
     )
@@ -28,21 +24,21 @@ async def get_existing_idempotency_key(
 
 async def create_idempotency_record(
     db: AsyncSession,
-    *,
     key: str,
-    user: User,
+    user_id: int,
     operation: str,
     resource_id: int | None,
-) -> IdempotencyKey:
+):
 
     record = IdempotencyKey(
         key=key,
-        user_id=user.id,
+        user_id=user_id,
         operation=operation,
         resource_id=resource_id,
-        created_at=datetime.now(timezone.utc),
     )
 
     db.add(record)
+
+    await db.flush()
 
     return record
