@@ -1,118 +1,122 @@
+"""
+Pydantic request/response schemas.
+"""
+
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from .models import ReservationStatus, WaitlistStatus
 
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(min_length=3, max_length=255)
+
+
+# ---------------------------------------------------------------------------
+# User
+# ---------------------------------------------------------------------------
 
 class UserResponse(BaseModel):
-
     id: int
     name: str
     email: str
 
+    model_config = ConfigDict(
+        from_attributes=True
+    )
 
-class SeatResponse(BaseModel):
 
-    id: int
-    seat_number: int
-
-    class Config:
-        from_attributes = True
-
+# ---------------------------------------------------------------------------
+# Reservation
+# ---------------------------------------------------------------------------
 
 class HoldSeatRequest(BaseModel):
-
-    seat_id: int = Field(
-        gt=0,
-        description="ID of the seat the user wants to hold.",
-    )
-
-    idempotency_key: str = Field(
-        min_length=1,
-        max_length=255,
-    )
-
-
-class ConfirmReservationRequest(BaseModel):
-
-    idempotency_key: str = Field(
-        min_length=1,
-        max_length=255,
-    )
-
-
-class CancelReservationRequest(BaseModel):
-
-    idempotency_key: str = Field(
-        min_length=1,
-        max_length=255,
-    )
+    seat_id: int = Field(gt=0)
 
 
 class ReservationResponse(BaseModel):
-
     id: int
     user_id: int
     seat_id: int
-    status: ReservationStatus
-
+    status: str
     created_at: datetime
     held_until: datetime | None
     confirmed_at: datetime | None
     cancelled_at: datetime | None
 
-    class Config:
-        from_attributes = True
-
-
-class JoinWaitlistRequest(BaseModel):
-
-    idempotency_key: str = Field(
-        min_length=1,
-        max_length=255,
+    model_config = ConfigDict(
+        from_attributes=True
     )
 
 
-class WaitlistResponse(BaseModel):
+# ---------------------------------------------------------------------------
+# Seat
+# ---------------------------------------------------------------------------
 
+class SeatResponse(BaseModel):
     id: int
-    user_id: int
-    created_at: datetime
-    status: WaitlistStatus
+    seat_number: int
 
-    position: int | None = None
-
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(
+        from_attributes=True
+    )
 
 
-
-class ActivityResponse(BaseModel):
-
+class SeatStateResponse(BaseModel):
     id: int
-    reservation_id: int
-
-    previous_state: str | None
-    new_state: str
-
-    timestamp: datetime
-    reason: str
-
-    class Config:
-        from_attributes = True
+    seat_number: int
+    status: str
+    reservation_id: int | None
+    held_until: datetime | None
 
 
+# ---------------------------------------------------------------------------
+# Availability
+# ---------------------------------------------------------------------------
 
 class AvailabilityResponse(BaseModel):
-
+    total: int
     available: int
     held: int
     confirmed: int
 
 
+# ---------------------------------------------------------------------------
+# Waitlist
+# ---------------------------------------------------------------------------
 
-class UserReservationResponse(BaseModel):
+class WaitlistResponse(BaseModel):
+    id: int
+    user_id: int
+    status: str
+    created_at: datetime
 
-    reservation: ReservationResponse | None
-    waitlist_position: int | None
+    model_config = ConfigDict(
+        from_attributes=True
+    )
+
+
+class WaitlistStatusResponse(BaseModel):
+    entry: WaitlistResponse | None
+    position: int | None
+
+
+# ---------------------------------------------------------------------------
+# Activity
+# ---------------------------------------------------------------------------
+
+class ActivityResponse(BaseModel):
+    id: int
+    reservation_id: int
+    previous_state: str | None
+    new_state: str
+    timestamp: datetime
+    reason: str
+
+    model_config = ConfigDict(
+        from_attributes=True
+    )

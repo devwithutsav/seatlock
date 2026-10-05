@@ -1,22 +1,38 @@
-from datetime import datetime
+"""
+SQLAlchemy database models for SeatLock.
+"""
+
+from datetime import datetime, timezone
 from enum import Enum
 
 from sqlalchemy import (
-    DateTime,
     ForeignKey,
-    Integer,
-    String,
-    Text,
-    UniqueConstraint,
     Index,
+    String,
+    UniqueConstraint,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import (
+    Mapped,
+    mapped_column,
+    relationship,
+)
 
 from .database import Base
 
 
-class ReservationStatus(str, Enum):
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class ReservationStatus(str, Enum):
     HELD = "HELD"
     CONFIRMED = "CONFIRMED"
     CANCELLED = "CANCELLED"
@@ -24,19 +40,20 @@ class ReservationStatus(str, Enum):
 
 
 class WaitlistStatus(str, Enum):
-
     WAITING = "WAITING"
     PROMOTED = "PROMOTED"
     CANCELLED = "CANCELLED"
 
 
-class User(Base):
+# ---------------------------------------------------------------------------
+# User
+# ---------------------------------------------------------------------------
 
+class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
+        primary_key=True
     )
 
     name: Mapped[str] = mapped_column(
@@ -60,17 +77,18 @@ class User(Base):
     )
 
 
-class Seat(Base):
+# ---------------------------------------------------------------------------
+# Seat
+# ---------------------------------------------------------------------------
 
+class Seat(Base):
     __tablename__ = "seats"
 
     id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
+        primary_key=True
     )
 
     seat_number: Mapped[int] = mapped_column(
-        Integer,
         unique=True,
         nullable=False,
     )
@@ -80,13 +98,15 @@ class Seat(Base):
     )
 
 
-class Reservation(Base):
+# ---------------------------------------------------------------------------
+# Reservation
+# ---------------------------------------------------------------------------
 
+class Reservation(Base):
     __tablename__ = "reservations"
 
     id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
+        primary_key=True
     )
 
     user_id: Mapped[int] = mapped_column(
@@ -103,25 +123,23 @@ class Reservation(Base):
 
     status: Mapped[ReservationStatus] = mapped_column(
         nullable=False,
+        index=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        default=utc_now,
         nullable=False,
     )
 
     held_until: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
         nullable=True,
     )
 
     confirmed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
         nullable=True,
     )
 
     cancelled_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
         nullable=True,
     )
 
@@ -133,33 +151,50 @@ class Reservation(Base):
         back_populates="reservations",
     )
 
-    activity_logs: Mapped[list["ActivityLog"]] = relationship(
+    activities: Mapped[list["ActivityLog"]] = relationship(
         back_populates="reservation",
+        order_by="ActivityLog.timestamp",
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_reservation_user_status",
+            "user_id",
+            "status",
+        ),
+        Index(
+            "ix_reservation_seat_status",
+            "seat_id",
+            "status",
+        ),
     )
 
 
-class WaitlistEntry(Base):
+# ---------------------------------------------------------------------------
+# Waitlist
+# ---------------------------------------------------------------------------
 
+class WaitlistEntry(Base):
     __tablename__ = "waitlist_entries"
 
     id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
+        primary_key=True
     )
 
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id"),
         nullable=False,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
+        index=True,
     )
 
     status: Mapped[WaitlistStatus] = mapped_column(
         nullable=False,
-        default=WaitlistStatus.WAITING,
+        index=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        default=utc_now,
+        nullable=False,
     )
 
     user: Mapped["User"] = relationship(
@@ -172,16 +207,23 @@ class WaitlistEntry(Base):
             "user_id",
             "status",
         ),
+        Index(
+            "ix_waitlist_status_created",
+            "status",
+            "created_at",
+        ),
     )
 
 
-class ActivityLog(Base):
+# ---------------------------------------------------------------------------
+# Activity log
+# ---------------------------------------------------------------------------
 
+class ActivityLog(Base):
     __tablename__ = "activity_logs"
 
     id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
+        primary_key=True
     )
 
     reservation_id: Mapped[int] = mapped_column(
@@ -191,37 +233,39 @@ class ActivityLog(Base):
     )
 
     previous_state: Mapped[str | None] = mapped_column(
-        String(30),
+        String(50),
         nullable=True,
     )
 
     new_state: Mapped[str] = mapped_column(
-        String(30),
+        String(50),
         nullable=False,
     )
 
     timestamp: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        default=utc_now,
         nullable=False,
     )
 
     reason: Mapped[str] = mapped_column(
-        Text,
+        String(255),
         nullable=False,
     )
 
     reservation: Mapped["Reservation"] = relationship(
-        back_populates="activity_logs",
+        back_populates="activities",
     )
 
 
-class IdempotencyKey(Base):
+# ---------------------------------------------------------------------------
+# Idempotency
+# ---------------------------------------------------------------------------
 
+class IdempotencyKey(Base):
     __tablename__ = "idempotency_keys"
 
     id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
+        primary_key=True
     )
 
     key: Mapped[str] = mapped_column(
@@ -240,12 +284,11 @@ class IdempotencyKey(Base):
     )
 
     resource_id: Mapped[int | None] = mapped_column(
-        Integer,
         nullable=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        default=utc_now,
         nullable=False,
     )
 
@@ -254,6 +297,6 @@ class IdempotencyKey(Base):
             "key",
             "user_id",
             "operation",
-            name="uq_idempotency_key_user_operation",
+            name="uq_idempotency_key",
         ),
     )

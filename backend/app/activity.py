@@ -1,3 +1,7 @@
+"""
+Append-only reservation activity timeline.
+"""
+
 from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,17 +16,21 @@ async def record_activity(
     new_state: str,
     reason: str,
 ):
-  
+    """
+    Add an activity record.
+
+    This function never commits.
+    The caller's transaction controls the commit.
+    """
 
     activity = ActivityLog(
         reservation_id=reservation_id,
         previous_state=previous_state,
         new_state=new_state,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
         reason=reason,
     )
 
     db.add(activity)
-
 
     await db.flush()

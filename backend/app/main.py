@@ -1,59 +1,96 @@
+"""
+SeatLock FastAPI application.
+"""
+
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import (
     Cookie,
     Depends,
     FastAPI,
+    Header,
     Response,
+    WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from .database import Base, engine, get_db
 from . import models
 from .auth import (
     get_current_user,
     login_user,
     logout_user,
 )
-from sqlalchemy.ext.asyncio import AsyncSession
-import asyncio
-
 from .background import expire_holds
+from .database import (
+    Base,
+    SessionLocal,
+    engine,
+    get_db,
+    settings,
+)
+from .reservations import (
+    cancel_reservation,
+    confirm_reservation,
+    get_active_reservation_for_user,
+    hold_seat,
+)
+from .realtime import manager
+from .schemas import (
+    ActivityResponse,
+    AvailabilityResponse,
+    HoldSeatRequest,
+    LoginRequest,
+    ReservationResponse,
+    SeatStateResponse,
+    UserResponse,
+    WaitlistResponse,
+    WaitlistStatusResponse,
+)
+from .waitlist import (
+    cancel_waitlist,
+    get_active_waitlist_entry,
+    get_waitlist_position,
+    join_waitlist,
+)
 
 
-
-class LoginRequest(BaseModel):
-    name: str
-    email: str
-
+# ---------------------------------------------------------------------------
+# Database initialization
+# ---------------------------------------------------------------------------
 
 async def initialize_database():
     """
-    Create database tables and seed the 20 workshop seats.
+    Create all tables and ensure seats 1-20 exist.
     """
 
     async with engine.begin() as conn:
 
-        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(
+            Base.metadata.create_all
+        )
 
-    async with AsyncSession(engine) as db:
+
+    async with SessionLocal() as db:
 
         result = await db.execute(
             select(models.Seat)
         )
 
-        existing_seats = result.scalars().all()
+        seats = result.scalars().all()
 
         existing_numbers = {
             seat.seat_number
-            for seat in existing_seats
+            for seat in seats
         }
 
         for seat_number in range(1, 21):
 
             if seat_number not in existing_numbers:
+
                 db.add(
                     models.Seat(
                         seat_number=seat_number
@@ -63,22 +100,25 @@ async def initialize_database():
         await db.commit()
 
 
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
-    print("Initializing database...")
+    print("Initializing SeatLock database...")
 
     await initialize_database()
 
-    print("Database initialized.")
+    print("Database ready.")
 
-    # Start background expiry worker.
     expiry_task = asyncio.create_task(
         expire_holds()
     )
 
     try:
+
         yield
 
     finally:
@@ -90,30 +130,38 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
-        print("Shutting down database connection...")
-
         await engine.dispose()
 
+        print("SeatLock shutdown complete.")
 
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="SeatLock",
-    description="Real-time workshop seat reservation system",
+    description="Real-time reservation system for a 20-seat workshop",
     lifespan=lifespan,
 )
 
 
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-    ],
+    allow_origins=settings.frontend_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 
 @app.get("/")
 async def root():
@@ -122,19 +170,26 @@ async def root():
     }
 
 
-@app.post("/auth/login")
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok"
+    }
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/auth/login",
+    response_model=UserResponse,
+)
 async def login(
     request: LoginRequest,
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Log in a user.
-
-    For this project, providing a name and email is enough to establish
-    a demo identity.
-    """
-
     user = await login_user(
         email=request.email,
         name=request.name,
@@ -142,47 +197,466 @@ async def login(
         db=db,
     )
 
-    return {
-        "message": "Login successful",
-        "user": {
-            "id": user.id,
-            "name": user.name,
-            "email": user.email,
-        },
-    }
+    return user
 
 
-@app.get("/auth/me")
-async def get_me(
-    current_user: models.User = Depends(get_current_user),
+@app.get(
+    "/auth/me",
+    response_model=UserResponse,
+)
+async def me(
+    current_user: models.User = Depends(
+        get_current_user
+    ),
 ):
-    """
-    Return the currently authenticated user.
-
-    This endpoint is useful for testing whether the session cookie works.
-    """
-
-    return {
-        "id": current_user.id,
-        "name": current_user.name,
-        "email": current_user.email,
-    }
+    return current_user
 
 
 @app.post("/auth/logout")
 async def logout(
     response: Response,
-    session_token: str | None = Cookie(default=None),
+    session_token: str | None = Cookie(
+        default=None
+    ),
 ):
-    """
-    Log the current user out.
-    """
-
-    await logout_user(
-        session_token=session_token,
-        response=response,
+    logout_user(
+        session_token,
+        response,
     )
 
     return {
         "message": "Logout successful"
     }
+
+
+# ---------------------------------------------------------------------------
+# Seats
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/seats",
+    response_model=list[SeatStateResponse],
+)
+async def get_seats(
+    db: AsyncSession = Depends(get_db),
+):
+    seats_result = await db.execute(
+        select(models.Seat)
+        .order_by(models.Seat.seat_number)
+    )
+
+    seats = seats_result.scalars().all()
+
+
+    reservations_result = await db.execute(
+        select(models.Reservation)
+        .where(
+            models.Reservation.status.in_(
+                [
+                    models.ReservationStatus.HELD,
+                    models.ReservationStatus.CONFIRMED,
+                ]
+            )
+        )
+    )
+
+    reservations = (
+        reservations_result.scalars().all()
+    )
+
+
+    reservation_by_seat = {
+        reservation.seat_id: reservation
+        for reservation in reservations
+    }
+
+
+    response = []
+
+    for seat in seats:
+
+        reservation = reservation_by_seat.get(
+            seat.id
+        )
+
+        if reservation is None:
+
+            seat_status = "AVAILABLE"
+
+        else:
+
+            seat_status = (
+                reservation.status.value
+            )
+
+
+        response.append(
+            {
+                "id": seat.id,
+                "seat_number": seat.seat_number,
+                "status": seat_status,
+                "reservation_id": (
+                    reservation.id
+                    if reservation
+                    else None
+                ),
+                "held_until": (
+                    reservation.held_until
+                    if reservation
+                    and reservation.status
+                    == models.ReservationStatus.HELD
+                    else None
+                ),
+            }
+        )
+
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Availability
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/availability",
+    response_model=AvailabilityResponse,
+)
+async def availability(
+    db: AsyncSession = Depends(get_db),
+):
+
+    total = (
+        await db.scalar(
+            select(func.count(models.Seat.id))
+        )
+    )
+
+
+    held = (
+        await db.scalar(
+            select(
+                func.count(
+                    models.Reservation.id
+                )
+            ).where(
+                models.Reservation.status
+                == models.ReservationStatus.HELD
+            )
+        )
+    )
+
+
+    confirmed = (
+        await db.scalar(
+            select(
+                func.count(
+                    models.Reservation.id
+                )
+            ).where(
+                models.Reservation.status
+                == models.ReservationStatus.CONFIRMED
+            )
+        )
+    )
+
+
+    total = int(total or 0)
+    held = int(held or 0)
+    confirmed = int(confirmed or 0)
+
+    available = (
+        total
+        - held
+        - confirmed
+    )
+
+
+    return {
+        "total": total,
+        "available": available,
+        "held": held,
+        "confirmed": confirmed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Reservation: hold
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/reservations/hold",
+    response_model=ReservationResponse,
+)
+async def create_hold(
+    request: HoldSeatRequest,
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        min_length=1,
+    ),
+    current_user: models.User = Depends(
+        get_current_user
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+
+    return await hold_seat(
+        db=db,
+        user=current_user,
+        seat_id=request.seat_id,
+        idempotency_key=idempotency_key,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reservation: confirm
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/reservations/{reservation_id}/confirm",
+    response_model=ReservationResponse,
+)
+async def confirm(
+    reservation_id: int,
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        min_length=1,
+    ),
+    current_user: models.User = Depends(
+        get_current_user
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+
+    return await confirm_reservation(
+        db=db,
+        user=current_user,
+        reservation_id=reservation_id,
+        idempotency_key=idempotency_key,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reservation: cancel
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/reservations/{reservation_id}/cancel",
+    response_model=ReservationResponse,
+)
+async def cancel(
+    reservation_id: int,
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        min_length=1,
+    ),
+    current_user: models.User = Depends(
+        get_current_user
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+
+    return await cancel_reservation(
+        db=db,
+        user=current_user,
+        reservation_id=reservation_id,
+        idempotency_key=idempotency_key,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Current user's reservation
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/reservations/me",
+    response_model=ReservationResponse | None,
+)
+async def my_reservation(
+    current_user: models.User = Depends(
+        get_current_user
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+
+    return await get_active_reservation_for_user(
+        db,
+        current_user.id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Activity timeline
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/reservations/{reservation_id}/activity",
+    response_model=list[ActivityResponse],
+)
+async def reservation_activity(
+    reservation_id: int,
+    current_user: models.User = Depends(
+        get_current_user
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+
+    reservation_result = await db.execute(
+        select(models.Reservation)
+        .where(
+            models.Reservation.id
+            == reservation_id,
+            models.Reservation.user_id
+            == current_user.id,
+        )
+    )
+
+    reservation = (
+        reservation_result.scalar_one_or_none()
+    )
+
+    if reservation is None:
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=404,
+            detail="Reservation not found",
+        )
+
+
+    result = await db.execute(
+        select(models.ActivityLog)
+        .where(
+            models.ActivityLog.reservation_id
+            == reservation_id
+        )
+        .order_by(
+            models.ActivityLog.timestamp,
+            models.ActivityLog.id,
+        )
+    )
+
+    return result.scalars().all()
+
+
+# ---------------------------------------------------------------------------
+# Waitlist: join
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/waitlist/join",
+    response_model=WaitlistResponse,
+)
+async def waitlist_join(
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        min_length=1,
+    ),
+    current_user: models.User = Depends(
+        get_current_user
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+
+    return await join_waitlist(
+        db=db,
+        user=current_user,
+        idempotency_key=idempotency_key,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Waitlist: cancel
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/waitlist/{entry_id}/cancel",
+    response_model=WaitlistResponse,
+)
+async def waitlist_cancel(
+    entry_id: int,
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        min_length=1,
+    ),
+    current_user: models.User = Depends(
+        get_current_user
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+
+    return await cancel_waitlist(
+        db=db,
+        user=current_user,
+        entry_id=entry_id,
+        idempotency_key=idempotency_key,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Current user's waitlist position
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/waitlist/me",
+    response_model=WaitlistStatusResponse,
+)
+async def my_waitlist_status(
+    current_user: models.User = Depends(
+        get_current_user
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+
+    entry = await get_active_waitlist_entry(
+        db,
+        current_user.id,
+    )
+
+    if entry is None:
+
+        return {
+            "entry": None,
+            "position": None,
+        }
+
+
+    position = await get_waitlist_position(
+        db,
+        entry,
+    )
+
+    return {
+        "entry": entry,
+        "position": position,
+    }
+
+
+# ---------------------------------------------------------------------------
+# WebSocket
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws")
+async def websocket_endpoint(
+    websocket: WebSocket,
+):
+
+    await manager.connect(
+        websocket
+    )
+
+    try:
+
+        while True:
+
+            await websocket.receive_text()
+
+    except WebSocketDisconnect:
+
+        manager.disconnect(
+            websocket
+        )
