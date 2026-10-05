@@ -25,18 +25,3 @@ Each state-changing request carries an `Idempotency-Key`. Keys are scoped by use
 
 After a transaction commits, the backend broadcasts a WebSocket event. Connected frontends refetch state from REST so the database remains the source of truth.
 
-## Concurrency test
-
-Run:
-
-```bash
-python tests/test_concurrency.py
-```
-
-Paste the actual test output below after running it locally:
-
-```text
-[PASTE ACTUAL OUTPUT HERE]
-```
-
-Do not replace this placeholder with fabricated results.

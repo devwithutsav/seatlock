@@ -1,6 +1,6 @@
-# SeatLock
+# Task ID: SeatLock
 
-SeatLock is a real-time reservation system for a small campus workshop with only 20 seats. The application looks simple from the outside — choose a seat, hold it, confirm it, or join a waitlist — but the interesting part is what happens when many people try to do those things at the same time.
+SeatLock is a real-time reservation system for a small campus workshop with only 20 seats. The application looks simple from the outside — choose a seat, hold it, confirm it, or join a waitlist — but the interesting part is what happens when many people try to do those things simultaneously
 
 The goal of the project is to make the reservation state trustworthy. A seat should never be confirmed by two users, an expired hold should never be confirmable, retrying the same request should not create duplicate side effects, and a waitlisted user should be promoted in FIFO order when a seat becomes free.
 
@@ -132,23 +132,13 @@ cp .env.example .env
 Set your own PostgreSQL URL:
 
 ```env
-DATABASE_URL=postgresql+asyncpg://YOUR_USER:YOUR_PASSWORD@localhost:5432/seatlock_rebuilt
+DATABASE_URL=postgresql+asyncpg://utsavkhandelwal:********@localhost:5432/seatlock_rebuilt
 FRONTEND_ORIGINS=http://localhost:5173
 HOLD_DURATION_SECONDS=300
 SESSION_DAYS=7
 ```
 
-If your local PostgreSQL role does not require a password:
-
-```env
-DATABASE_URL=postgresql+asyncpg://YOUR_USER@localhost:5432/seatlock_rebuilt
-```
-
-Never commit `.env`. It is already ignored by `.gitignore`.
-
 ### Backend
-
-Python 3.12 or 3.13 is recommended.
 
 ```bash
 cd backend
@@ -180,56 +170,6 @@ http://localhost:5173
 
 During local development Vite proxies `/api` to the FastAPI backend, so no frontend `.env` is required.
 
-## Deployment
-
-### Frontend: Vercel
-
-Deploy the repository to Vercel and set the **Root Directory** to `frontend`.
-
-Use:
-
-```text
-Framework preset: Vite
-Build command: npm run build
-Output directory: dist
-```
-
-Add this Vercel environment variable:
-
-```env
-VITE_API_BASE_URL=https://YOUR-BACKEND-DOMAIN
-```
-
-Then redeploy the frontend.
-
-### Backend: Render or Railway
-
-SeatLock's backend should run on a service that supports a continuously running FastAPI process and WebSockets. Vercel serverless functions are not a good fit for the expiry worker and persistent WebSocket connection.
-
-Set these backend environment variables:
-
-```env
-DATABASE_URL=YOUR_MANAGED_POSTGRES_URL
-FRONTEND_ORIGINS=https://YOUR-VERCEL-DOMAIN
-HOLD_DURATION_SECONDS=300
-SESSION_DAYS=7
-```
-
-If the database provider gives:
-
-```text
-postgresql://...
-```
-
-SeatLock automatically converts it to SQLAlchemy's asyncpg form.
-
-Start command:
-
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port $PORT
-```
-
-After the backend is live, put its HTTPS URL into `VITE_API_BASE_URL` in Vercel and redeploy.
 
 ## Concurrency test
 
@@ -242,7 +182,7 @@ pip install -r tests/requirements.txt
 Against a clean local database:
 
 ```bash
-export DATABASE_URL='postgresql+asyncpg://YOUR_USER:YOUR_PASSWORD@localhost:5432/seatlock_rebuilt'
+export DATABASE_URL='postgresql+asyncpg://utsavkhandelwal:********@localhost:5432/seatlock_rebuilt'
 export ALLOW_TEST_RESET=true
 python tests/reset_db.py
 python tests/test_concurrency.py
