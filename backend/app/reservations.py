@@ -27,7 +27,7 @@ from .waitlist import (
 )
 
 
-HOLD_DURATION_SECONDS = 60
+HOLD_DURATION_SECONDS = 300
 
 
 def utc_now() -> datetime:

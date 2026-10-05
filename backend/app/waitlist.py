@@ -28,7 +28,7 @@ from .models import (
 from .realtime import manager
 
 
-HOLD_DURATION_SECONDS = 60
+HOLD_DURATION_SECONDS = 300
 
 
 # ---------------------------------------------------------------------------
