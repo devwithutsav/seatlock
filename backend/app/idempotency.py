@@ -5,6 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .models import IdempotencyKey
 
 
+# Atomically claims an idempotency key.
+# Returns None on successful insert (caller proceeds), or the existing record if already claimed.
 async def claim_key(
     db: AsyncSession,
     key: str,
@@ -31,6 +33,7 @@ async def claim_key(
     if inserted is not None:
         return None
 
+    # Fetch existing row to evaluate replay status or in-flight collision
     existing = await db.execute(
         select(IdempotencyKey).where(
             IdempotencyKey.key == key,
@@ -41,6 +44,7 @@ async def claim_key(
     return existing.scalar_one()
 
 
+# Attaches created/mutated resource ID to key record once operation successfully completes
 async def complete_key(
     db: AsyncSession,
     key: str,

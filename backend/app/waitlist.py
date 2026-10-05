@@ -18,6 +18,7 @@ from .models import (
 )
 
 
+# Returns the user's current active queue ticket, if any
 async def get_active_waitlist_entry(db: AsyncSession, user_id: int) -> WaitlistEntry | None:
     result = await db.execute(
         select(WaitlistEntry)
@@ -30,6 +31,7 @@ async def get_active_waitlist_entry(db: AsyncSession, user_id: int) -> WaitlistE
     return result.scalar_one_or_none()
 
 
+# Computes deterministic 1-based FIFO queue position with timestamp and ID tie-breaking
 async def get_waitlist_position(db: AsyncSession, entry: WaitlistEntry) -> int:
     count = await db.scalar(
         select(func.count(WaitlistEntry.id)).where(
@@ -46,6 +48,7 @@ async def get_waitlist_position(db: AsyncSession, entry: WaitlistEntry) -> int:
     return int(count or 0)
 
 
+# Enqueues user into FIFO waitlist only after verifying capacity is 100% committed
 async def join_waitlist(
     db: AsyncSession,
     user: User,
@@ -54,6 +57,7 @@ async def join_waitlist(
     operation = "waitlist_join"
     existing_key = await claim_key(db, idempotency_key, user.id, operation)
 
+    # Replay protection
     if existing_key is not None:
         resource_id = existing_key.resource_id
         await db.rollback()
@@ -67,6 +71,7 @@ async def join_waitlist(
     )
     locked_user = locked_user_result.scalar_one()
 
+    # Precondition: active ticket holders cannot queue up again
     active = await db.execute(
         select(Reservation).where(
             Reservation.user_id == locked_user.id,
@@ -82,7 +87,7 @@ async def join_waitlist(
         await db.rollback()
         raise HTTPException(status_code=409, detail="You are already on the waitlist")
 
-    # Lock all seats while deciding whether the workshop is full.
+    # Serialize global capacity check by locking all seat rows in consistent order
     await db.execute(select(Seat).order_by(Seat.id).with_for_update())
 
     now = utc_now()
@@ -99,6 +104,7 @@ async def join_waitlist(
     )
     total = await db.scalar(select(func.count(Seat.id)))
 
+    # Reject joining waitlist if open inventory remains
     if int(occupied or 0) < int(total or 0):
         await db.rollback()
         raise HTTPException(status_code=409, detail="Seats are still available")
@@ -116,6 +122,7 @@ async def join_waitlist(
     return entry
 
 
+# Opt-out endpoint to relinquish waitlist queue spot
 async def cancel_waitlist(
     db: AsyncSession,
     user: User,
@@ -165,11 +172,14 @@ async def cancel_waitlist(
     return entry
 
 
+# Reallocates a freed seat to the head of the waitlist.
+# Loops to automatically prune candidates who already managed to obtain seats elsewhere.
 async def promote_next_waitlisted_user(
     db: AsyncSession,
     seat_id: int,
 ) -> Reservation | None:
     while True:
+        # Non-blocking lock on head candidate to prevent worker deadlocks
         result = await db.execute(
             select(WaitlistEntry)
             .where(WaitlistEntry.status == WaitlistStatus.WAITING)
@@ -187,6 +197,7 @@ async def promote_next_waitlisted_user(
         )
         user = user_result.scalar_one()
 
+        # Invalidate entry if user holds an active seat from another path
         active_result = await db.execute(
             select(Reservation).where(
                 Reservation.user_id == user.id,
@@ -203,6 +214,7 @@ async def promote_next_waitlisted_user(
 
         await db.execute(select(Seat).where(Seat.id == seat_id).with_for_update())
 
+        # Grant candidate a temporary lease
         now = utc_now()
         reservation = Reservation(
             user_id=user.id,

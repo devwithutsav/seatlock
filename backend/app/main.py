@@ -46,6 +46,7 @@ from .waitlist import (
 )
 
 
+# Auto-creates tables and seeds default seats if empty on boot
 async def initialize_database() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -56,9 +57,11 @@ async def initialize_database() -> None:
             db.add_all([models.Seat(seat_number=i) for i in range(1, 21)])
             await db.commit()
 
+    # Reclaim holds that elapsed during server downtime
     await expire_holds_once()
 
 
+# Manages background workers and async connection pool lifecycles
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await initialize_database()
@@ -100,6 +103,8 @@ async def health():
     return {"status": "ok"}
 
 
+# Auth Endpoints
+
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
     user, token = await login_user(request.name, request.email, db)
@@ -121,6 +126,9 @@ async def logout(
     return {"message": "Logged out"}
 
 
+# Seat & Availability Views
+
+# Returns current grid snapshot; triggers passive expiration cleanup first
 @app.get("/seats", response_model=list[SeatStateResponse])
 async def get_seats(db: AsyncSession = Depends(get_db)):
     await expire_holds_once()
@@ -184,6 +192,8 @@ async def availability(db: AsyncSession = Depends(get_db)):
     }
 
 
+# Reservation Workflow (Idempotent)
+
 @app.post("/reservations/hold", response_model=ReservationResponse)
 async def create_hold(
     request: HoldSeatRequest,
@@ -239,6 +249,7 @@ async def reservation_activity(
     current_user: models.User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Enforce ownership check before serving audit records
     owns = await db.scalar(
         select(func.count(models.Reservation.id)).where(
             models.Reservation.id == reservation_id,
@@ -255,6 +266,8 @@ async def reservation_activity(
     )
     return result.scalars().all()
 
+
+# Waitlist Workflow
 
 @app.post("/waitlist/join", response_model=WaitlistResponse)
 async def waitlist_join(
@@ -295,6 +308,8 @@ async def my_waitlist(
     }
 
 
+# Realtime WebSocket Transport
+
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -303,6 +318,7 @@ async def websocket_endpoint(
     async with SessionLocal() as db:
         user = await user_from_token(token, db)
 
+    # 1008: Policy violation (unauthorized WS handshake)
     if user is None:
         await websocket.close(code=1008)
         return
@@ -310,6 +326,7 @@ async def websocket_endpoint(
     await manager.connect(websocket)
     try:
         while True:
+            # Keep-alive loop; broadcasts are server-pushed via ConnectionManager
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)

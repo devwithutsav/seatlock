@@ -13,6 +13,7 @@ from .realtime import manager
 from .waitlist import promote_next_waitlisted_user
 
 
+# Fetches the user's current valid holding or confirmed booking
 async def get_active_reservation_for_user(
     db: AsyncSession,
     user_id: int,
@@ -30,6 +31,8 @@ async def get_active_reservation_for_user(
     return result.scalar_one_or_none()
 
 
+# Acquires a temporary lease on a seat.
+# Enforces concurrency safety via pessimistic row locks (FOR UPDATE) and DB partial unique indexes.
 async def hold_seat(
     db: AsyncSession,
     user: User,
@@ -39,6 +42,7 @@ async def hold_seat(
     operation = "hold"
     existing_key = await claim_key(db, idempotency_key, user.id, operation)
 
+    # Idempotent replay: return cached result or block ongoing concurrent duplicate
     if existing_key is not None:
         resource_id = existing_key.resource_id
         await db.rollback()
@@ -55,6 +59,7 @@ async def hold_seat(
             raise HTTPException(status_code=409, detail="Idempotency key was used for another seat")
         return reservation
 
+    # Lock user row first to serialize hold attempts by the same account
     locked_user_result = await db.execute(
         select(User).where(User.id == user.id).with_for_update()
     )
@@ -65,6 +70,7 @@ async def hold_seat(
         await db.rollback()
         raise HTTPException(status_code=409, detail="You already have an active reservation")
 
+    # Lock seat row to serialize concurrent lease attempts for the same seat
     seat_result = await db.execute(
         select(Seat).where(Seat.id == seat_id).with_for_update()
     )
@@ -95,6 +101,7 @@ async def hold_seat(
     )
     db.add(reservation)
 
+    # Catches race conditions caught by DB partial unique indexes
     try:
         await db.flush()
     except IntegrityError:
@@ -130,6 +137,7 @@ async def hold_seat(
     return reservation
 
 
+# Converts a temporary HELD lease into a permanent CONFIRMED booking
 async def confirm_reservation(
     db: AsyncSession,
     user: User,
@@ -157,7 +165,7 @@ async def confirm_reservation(
             raise HTTPException(status_code=404, detail="Reservation not found")
         return reservation
 
-    # Lock the user first so their reservation state changes are serialized.
+    # Lock user and target reservation row to avoid concurrent state mutation
     await db.execute(select(User).where(User.id == user.id).with_for_update())
 
     result = await db.execute(
@@ -180,6 +188,7 @@ async def confirm_reservation(
 
     now = utc_now()
 
+    # Expire on the spot if user confirms after TTL, auto-promoting waitlist
     if reservation.held_until is None or reservation.held_until <= now:
         reservation.status = ReservationStatus.EXPIRED
 
@@ -237,6 +246,7 @@ async def confirm_reservation(
     return reservation
 
 
+# Releases a held or confirmed reservation and passes the seat to the next waitlisted user
 async def cancel_reservation(
     db: AsyncSession,
     user: User,
@@ -299,6 +309,7 @@ async def cancel_reservation(
         "User cancelled reservation",
     )
 
+    # Immediately advance queue for the newly freed seat
     promoted = await promote_next_waitlisted_user(db, reservation.seat_id)
     await complete_key(db, idempotency_key, user.id, operation, reservation.id)
 

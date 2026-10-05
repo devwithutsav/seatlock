@@ -1,6 +1,8 @@
 from fastapi import WebSocket
 
 
+# In-memory pub/sub broker managing client WebSocket connections.
+# Note: In multi-instance deployments, back this with Redis Pub/Sub.
 class ConnectionManager:
     def __init__(self) -> None:
         self.connections: set[WebSocket] = set()
@@ -12,6 +14,7 @@ class ConnectionManager:
     def disconnect(self, websocket: WebSocket) -> None:
         self.connections.discard(websocket)
 
+    # Fan-out event broadcast with dead client cleanup on broken pipes
     async def broadcast(self, payload: dict) -> None:
         dead: list[WebSocket] = []
 

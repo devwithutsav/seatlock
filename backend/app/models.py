@@ -18,6 +18,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base
 
 
+# Guarantees standard UTC timestamps across engine and app layers
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -94,6 +95,7 @@ class Reservation(Base):
     user: Mapped[User] = relationship()
     seat: Mapped[Seat] = relationship()
 
+    # DB-level partial unique indexes: prevent double-booking or multi-holding even under race conditions
     __table_args__ = (
         Index(
             "uq_active_reservation_user",
@@ -120,6 +122,7 @@ class WaitlistEntry(Base):
     promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # Partial index: user can only occupy one active waitlist position at a time
     __table_args__ = (
         Index(
             "uq_waiting_user",
@@ -130,6 +133,7 @@ class WaitlistEntry(Base):
     )
 
 
+# Append-only immutable log for dispute resolution and auditing
 class ActivityLog(Base):
     __tablename__ = "activity_logs"
 
@@ -142,9 +146,10 @@ class ActivityLog(Base):
     previous_state: Mapped[str | None] = mapped_column(String(32))
     new_state: Mapped[str] = mapped_column(String(32), nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
-    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[Text] = mapped_column(Text, nullable=False)
 
 
+# Tracks mutation requests to guarantee at-most-once execution per (key, user, operation)
 class IdempotencyKey(Base):
     __tablename__ = "idempotency_keys"
 

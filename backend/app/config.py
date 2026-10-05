@@ -2,6 +2,7 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# Application settings loaded from env vars with async PG dialect normalization
 class Settings(BaseSettings):
     DATABASE_URL: str
     FRONTEND_ORIGINS: str = "http://localhost:5173"
@@ -14,6 +15,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # Ensures standard 'postgres://' URLs (e.g. from Heroku/Railway) use the asyncpg driver
     @property
     def database_url(self) -> str:
         url = self.DATABASE_URL.strip()
@@ -23,6 +25,7 @@ class Settings(BaseSettings):
             return "postgresql+asyncpg://" + url[len("postgresql://"):]
         return url
 
+    # Comma-separated CORS origin parser
     @property
     def frontend_origins(self) -> list[str]:
         return [origin.strip() for origin in self.FRONTEND_ORIGINS.split(",") if origin.strip()]

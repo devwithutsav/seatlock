@@ -9,6 +9,8 @@ from .realtime import manager
 from .waitlist import promote_next_waitlisted_user
 
 
+# Batch worker pass: cleans up stale holds and advances waitlisted candidates.
+# Uses `FOR UPDATE SKIP LOCKED` to allow safe multi-worker/process execution without deadlocks.
 async def expire_holds_once() -> int:
     async with SessionLocal() as db:
         now = utc_now()
@@ -38,6 +40,7 @@ async def expire_holds_once() -> int:
                 "Hold expired automatically",
             )
 
+            # Instantly reallocate freed seat to waitlist in same transaction
             next_reservation = await promote_next_waitlisted_user(
                 db,
                 reservation.seat_id,
@@ -47,6 +50,7 @@ async def expire_holds_once() -> int:
 
         await db.commit()
 
+        # Broadcast events after commit to avoid notifying on rolled-back state
         for reservation in expired:
             await manager.broadcast(
                 {
@@ -68,6 +72,7 @@ async def expire_holds_once() -> int:
         return len(expired)
 
 
+# Background loop running tick-based hold sweeps
 async def expiry_worker() -> None:
     while True:
         try:
@@ -75,6 +80,7 @@ async def expiry_worker() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # Prevent background loop crash on transient DB errors
             print(f"[expiry-worker] {type(exc).__name__}: {exc}")
 
         await asyncio.sleep(1)

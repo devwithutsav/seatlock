@@ -3,6 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
+# User registration/authentication payload
 class LoginRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     email: EmailStr
@@ -13,13 +14,16 @@ class LoginResponse(BaseModel):
     user: "UserResponse"
 
 
+# Safe public representation of User model (omits private internals)
 class UserResponse(BaseModel):
     id: int
     name: str
     email: str
+    # Enables automatic mapping from SQLAlchemy ORM entities
     model_config = ConfigDict(from_attributes=True)
 
 
+# Workshop constrained strictly to seats 1 through 20
 class HoldSeatRequest(BaseModel):
     seat_id: int = Field(gt=0, le=20)
 
@@ -36,6 +40,7 @@ class ReservationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# Serialized seat status for rendering the interactive seat map
 class SeatStateResponse(BaseModel):
     id: int
     seat_number: int
@@ -44,6 +49,7 @@ class SeatStateResponse(BaseModel):
     held_until: datetime | None
 
 
+# Aggregate counts for dashboard status badges
 class AvailabilityResponse(BaseModel):
     total: int
     available: int

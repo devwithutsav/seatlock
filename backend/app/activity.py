@@ -3,6 +3,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .models import ActivityLog
 
 
+# Records state transitions for audit trails within the active transaction.
+# Uses db.flush() so the record gets an ID/persists without committing outer work.
 async def record_activity(
     db: AsyncSession,
     reservation_id: int,

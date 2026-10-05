@@ -13,6 +13,7 @@ import type {
 const configuredApi = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
 const API_BASE = configuredApi || "/api";
 
+// Core HTTP wrapper handling JSON serialization, Bearer token injection, and structured error extraction
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken();
 
@@ -31,7 +32,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       const body = await response.json();
       message = body.detail ?? message;
     } catch {
-      // Keep generic HTTP message.
+      // Keep generic HTTP status message if body is unparseable
     }
     throw new Error(message);
   }
@@ -43,6 +44,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+// Generates unique client UUID per mutation attempt to enforce backend idempotency
 function key(prefix: string): string {
   return `${prefix}-${crypto.randomUUID()}`;
 }
@@ -62,6 +64,7 @@ export const getAvailability = () => request<Availability>("/availability");
 export const getMyReservation = () => request<Reservation | null>("/reservations/me");
 export const getMyWaitlist = () => request<WaitlistStatusResponse>("/waitlist/me");
 
+// Mutations carry unique Idempotency-Key headers
 export const holdSeat = (seatId: number) =>
   request<Reservation>("/reservations/hold", {
     method: "POST",
@@ -96,6 +99,7 @@ export const cancelWaitlist = (entryId: number) =>
     headers: { "Idempotency-Key": key("waitlist-cancel") }
   });
 
+// Establishes authenticated WebSocket connection for live UI invalidation
 export function createSocket(onMessage: () => void): WebSocket | null {
   const token = getToken();
   if (!token) return null;
