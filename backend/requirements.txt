@@ -1,9 +1,9 @@
 fastapi
 uvicorn[standard]
 sqlalchemy[asyncio]
+greenlet
 asyncpg
 pydantic
 pydantic-settings
-python-dotenv
-python-multipart
-greenlet
+email-validator
+httpx

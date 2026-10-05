@@ -1,10 +1,25 @@
-export type ReservationStatus = "HELD" | "CONFIRMED" | "CANCELLED" | "EXPIRED";
-export type WaitlistStatus = "WAITING" | "PROMOTED" | "CANCELLED";
-
 export interface User {
   id: number;
   name: string;
   email: string;
+}
+
+export interface LoginResponse {
+  token: string;
+  user: User;
+}
+
+export type ReservationStatus = "HELD" | "CONFIRMED" | "CANCELLED" | "EXPIRED";
+
+export interface Reservation {
+  id: number;
+  user_id: number;
+  seat_id: number;
+  status: ReservationStatus;
+  created_at: string;
+  held_until: string | null;
+  confirmed_at: string | null;
+  cancelled_at: string | null;
 }
 
 export interface SeatState {
@@ -22,22 +37,13 @@ export interface Availability {
   confirmed: number;
 }
 
-export interface Reservation {
-  id: number;
-  user_id: number;
-  seat_id: number;
-  status: ReservationStatus;
-  created_at: string;
-  held_until: string | null;
-  confirmed_at: string | null;
-  cancelled_at: string | null;
-}
-
 export interface WaitlistEntry {
   id: number;
   user_id: number;
-  status: WaitlistStatus;
+  status: "WAITING" | "PROMOTED" | "CANCELLED";
   created_at: string;
+  promoted_at: string | null;
+  cancelled_at: string | null;
 }
 
 export interface WaitlistStatusResponse {

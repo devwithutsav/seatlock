@@ -1,64 +1,27 @@
-"""
-WebSocket connection manager.
-"""
-
 from fastapi import WebSocket
 
 
 class ConnectionManager:
+    def __init__(self) -> None:
+        self.connections: set[WebSocket] = set()
 
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
-
-
-    async def connect(
-        self,
-        websocket: WebSocket,
-    ):
+    async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
+        self.connections.add(websocket)
 
-        self.active_connections.append(
-            websocket
-        )
+    def disconnect(self, websocket: WebSocket) -> None:
+        self.connections.discard(websocket)
 
+    async def broadcast(self, payload: dict) -> None:
+        dead: list[WebSocket] = []
 
-    def disconnect(
-        self,
-        websocket: WebSocket,
-    ):
-        if websocket in self.active_connections:
-            self.active_connections.remove(
-                websocket
-            )
-
-
-    async def broadcast(
-        self,
-        message: dict,
-    ):
-        """
-        Broadcast an event to all currently connected clients.
-        """
-
-        disconnected = []
-
-        for websocket in list(
-            self.active_connections
-        ):
-
+        for websocket in list(self.connections):
             try:
-
-                await websocket.send_json(
-                    message
-                )
-
+                await websocket.send_json(payload)
             except Exception:
+                dead.append(websocket)
 
-                disconnected.append(
-                    websocket
-                )
-
-        for websocket in disconnected:
+        for websocket in dead:
             self.disconnect(websocket)
 
 

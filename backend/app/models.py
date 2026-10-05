@@ -1,302 +1,160 @@
-"""
-SQLAlchemy database models for SeatLock.
-"""
-
+import enum
+import secrets
 from datetime import datetime, timezone
-from enum import Enum
 
 from sqlalchemy import (
+    DateTime,
+    Enum,
     ForeignKey,
     Index,
+    Integer,
     String,
+    Text,
     UniqueConstraint,
+    text,
 )
-from sqlalchemy.orm import (
-    Mapped,
-    mapped_column,
-    relationship,
-)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(timezone.utc)
 
 
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
-
-class ReservationStatus(str, Enum):
+class ReservationStatus(str, enum.Enum):
     HELD = "HELD"
     CONFIRMED = "CONFIRMED"
     CANCELLED = "CANCELLED"
     EXPIRED = "EXPIRED"
 
 
-class WaitlistStatus(str, Enum):
+class WaitlistStatus(str, enum.Enum):
     WAITING = "WAITING"
     PROMOTED = "PROMOTED"
     CANCELLED = "CANCELLED"
 
 
-# ---------------------------------------------------------------------------
-# User
-# ---------------------------------------------------------------------------
+reservation_status_enum = Enum(
+    ReservationStatus,
+    name="reservation_status",
+    native_enum=False,
+)
+
+waitlist_status_enum = Enum(
+    WaitlistStatus,
+    name="waitlist_status",
+    native_enum=False,
+)
+
 
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(
-        primary_key=True
-    )
-
-    name: Mapped[str] = mapped_column(
-        String(100),
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
         nullable=False,
     )
 
-    email: Mapped[str] = mapped_column(
-        String(255),
-        unique=True,
-        nullable=False,
-        index=True,
-    )
 
-    reservations: Mapped[list["Reservation"]] = relationship(
-        back_populates="user",
-    )
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
 
-    waitlist_entries: Mapped[list["WaitlistEntry"]] = relationship(
-        back_populates="user",
-    )
+    token: Mapped[str] = mapped_column(String(128), primary_key=True, default=lambda: secrets.token_urlsafe(48))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
+    user: Mapped[User] = relationship()
 
-# ---------------------------------------------------------------------------
-# Seat
-# ---------------------------------------------------------------------------
 
 class Seat(Base):
     __tablename__ = "seats"
 
-    id: Mapped[int] = mapped_column(
-        primary_key=True
-    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    seat_number: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
 
-    seat_number: Mapped[int] = mapped_column(
-        unique=True,
-        nullable=False,
-    )
-
-    reservations: Mapped[list["Reservation"]] = relationship(
-        back_populates="seat",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Reservation
-# ---------------------------------------------------------------------------
 
 class Reservation(Base):
     __tablename__ = "reservations"
 
-    id: Mapped[int] = mapped_column(
-        primary_key=True
-    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    seat_id: Mapped[int] = mapped_column(ForeignKey("seats.id", ondelete="CASCADE"), index=True, nullable=False)
+    status: Mapped[ReservationStatus] = mapped_column(reservation_status_enum, index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    held_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id"),
-        nullable=False,
-        index=True,
-    )
-
-    seat_id: Mapped[int] = mapped_column(
-        ForeignKey("seats.id"),
-        nullable=False,
-        index=True,
-    )
-
-    status: Mapped[ReservationStatus] = mapped_column(
-        nullable=False,
-        index=True,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        default=utc_now,
-        nullable=False,
-    )
-
-    held_until: Mapped[datetime | None] = mapped_column(
-        nullable=True,
-    )
-
-    confirmed_at: Mapped[datetime | None] = mapped_column(
-        nullable=True,
-    )
-
-    cancelled_at: Mapped[datetime | None] = mapped_column(
-        nullable=True,
-    )
-
-    user: Mapped["User"] = relationship(
-        back_populates="reservations",
-    )
-
-    seat: Mapped["Seat"] = relationship(
-        back_populates="reservations",
-    )
-
-    activities: Mapped[list["ActivityLog"]] = relationship(
-        back_populates="reservation",
-        order_by="ActivityLog.timestamp",
-    )
+    user: Mapped[User] = relationship()
+    seat: Mapped[Seat] = relationship()
 
     __table_args__ = (
         Index(
-            "ix_reservation_user_status",
+            "uq_active_reservation_user",
             "user_id",
-            "status",
+            unique=True,
+            postgresql_where=text("status IN ('HELD', 'CONFIRMED')"),
         ),
         Index(
-            "ix_reservation_seat_status",
+            "uq_active_reservation_seat",
             "seat_id",
-            "status",
+            unique=True,
+            postgresql_where=text("status IN ('HELD', 'CONFIRMED')"),
         ),
     )
 
-
-# ---------------------------------------------------------------------------
-# Waitlist
-# ---------------------------------------------------------------------------
 
 class WaitlistEntry(Base):
     __tablename__ = "waitlist_entries"
 
-    id: Mapped[int] = mapped_column(
-        primary_key=True
-    )
-
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id"),
-        nullable=False,
-        index=True,
-    )
-
-    status: Mapped[WaitlistStatus] = mapped_column(
-        nullable=False,
-        index=True,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        default=utc_now,
-        nullable=False,
-    )
-
-    user: Mapped["User"] = relationship(
-        back_populates="waitlist_entries",
-    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    status: Mapped[WaitlistStatus] = mapped_column(waitlist_status_enum, index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         Index(
-            "ix_waitlist_user_status",
+            "uq_waiting_user",
             "user_id",
-            "status",
-        ),
-        Index(
-            "ix_waitlist_status_created",
-            "status",
-            "created_at",
+            unique=True,
+            postgresql_where=text("status = 'WAITING'"),
         ),
     )
 
-
-# ---------------------------------------------------------------------------
-# Activity log
-# ---------------------------------------------------------------------------
 
 class ActivityLog(Base):
     __tablename__ = "activity_logs"
 
-    id: Mapped[int] = mapped_column(
-        primary_key=True
-    )
-
+    id: Mapped[int] = mapped_column(primary_key=True)
     reservation_id: Mapped[int] = mapped_column(
-        ForeignKey("reservations.id"),
-        nullable=False,
+        ForeignKey("reservations.id", ondelete="CASCADE"),
         index=True,
-    )
-
-    previous_state: Mapped[str | None] = mapped_column(
-        String(50),
-        nullable=True,
-    )
-
-    new_state: Mapped[str] = mapped_column(
-        String(50),
         nullable=False,
     )
+    previous_state: Mapped[str | None] = mapped_column(String(32))
+    new_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
 
-    timestamp: Mapped[datetime] = mapped_column(
-        default=utc_now,
-        nullable=False,
-    )
-
-    reason: Mapped[str] = mapped_column(
-        String(255),
-        nullable=False,
-    )
-
-    reservation: Mapped["Reservation"] = relationship(
-        back_populates="activities",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Idempotency
-# ---------------------------------------------------------------------------
 
 class IdempotencyKey(Base):
     __tablename__ = "idempotency_keys"
 
-    id: Mapped[int] = mapped_column(
-        primary_key=True
-    )
-
-    key: Mapped[str] = mapped_column(
-        String(255),
-        nullable=False,
-    )
-
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id"),
-        nullable=False,
-    )
-
-    operation: Mapped[str] = mapped_column(
-        String(100),
-        nullable=False,
-    )
-
-    resource_id: Mapped[int | None] = mapped_column(
-        nullable=True,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        default=utc_now,
-        nullable=False,
-    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(String(160), nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    operation: Mapped[str] = mapped_column(String(50), nullable=False)
+    resource_id: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint(
-            "key",
-            "user_id",
-            "operation",
-            name="uq_idempotency_key",
-        ),
+        UniqueConstraint("key", "user_id", "operation", name="uq_idempotency_key_user_operation"),
     )

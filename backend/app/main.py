@@ -1,49 +1,37 @@
-"""
-SeatLock FastAPI application.
-"""
-
 import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import (
-    Cookie,
     Depends,
     FastAPI,
     Header,
-    Response,
+    HTTPException,
+    Query,
     WebSocket,
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import models
-from .auth import (
-    get_current_user,
-    login_user,
-    logout_user,
-)
-from .background import expire_holds
-from .database import (
-    Base,
-    SessionLocal,
-    engine,
-    get_db,
-    settings,
-)
+from .auth import get_current_user, login_user, logout_user, user_from_token
+from .background import expire_holds_once, expiry_worker
+from .config import settings
+from .database import Base, SessionLocal, engine, get_db
+from .realtime import manager
 from .reservations import (
     cancel_reservation,
     confirm_reservation,
     get_active_reservation_for_user,
     hold_seat,
 )
-from .realtime import manager
 from .schemas import (
     ActivityResponse,
     AvailabilityResponse,
     HoldSeatRequest,
     LoginRequest,
+    LoginResponse,
     ReservationResponse,
     SeatStateResponse,
     UserResponse,
@@ -58,605 +46,272 @@ from .waitlist import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Database initialization
-# ---------------------------------------------------------------------------
-
-async def initialize_database():
-    """
-    Create all tables and ensure seats 1-20 exist.
-    """
-
+async def initialize_database() -> None:
     async with engine.begin() as conn:
-
-        await conn.run_sync(
-            Base.metadata.create_all
-        )
-
+        await conn.run_sync(Base.metadata.create_all)
 
     async with SessionLocal() as db:
+        count = await db.scalar(select(func.count(models.Seat.id)))
+        if int(count or 0) == 0:
+            db.add_all([models.Seat(seat_number=i) for i in range(1, 21)])
+            await db.commit()
 
-        result = await db.execute(
-            select(models.Seat)
-        )
+    await expire_holds_once()
 
-        seats = result.scalars().all()
-
-        existing_numbers = {
-            seat.seat_number
-            for seat in seats
-        }
-
-        for seat_number in range(1, 21):
-
-            if seat_number not in existing_numbers:
-
-                db.add(
-                    models.Seat(
-                        seat_number=seat_number
-                    )
-                )
-
-        await db.commit()
-
-
-# ---------------------------------------------------------------------------
-# Lifespan
-# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
-    print("Initializing SeatLock database...")
-
     await initialize_database()
-
-    print("Database ready.")
-
-    expiry_task = asyncio.create_task(
-        expire_holds()
-    )
-
+    task = asyncio.create_task(expiry_worker())
     try:
-
         yield
-
     finally:
-
-        expiry_task.cancel()
-
+        task.cancel()
         try:
-            await expiry_task
+            await task
         except asyncio.CancelledError:
             pass
-
         await engine.dispose()
 
-        print("SeatLock shutdown complete.")
-
-
-# ---------------------------------------------------------------------------
-# Application
-# ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="SeatLock",
-    description="Real-time reservation system for a 20-seat workshop",
+    title="SeatLock API",
+    version="1.0.0",
+    description="Concurrency-safe reservation API for a 20-seat workshop.",
     lifespan=lifespan,
 )
-
-
-# ---------------------------------------------------------------------------
-# CORS
-# ---------------------------------------------------------------------------
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.frontend_origins,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ---------------------------------------------------------------------------
-# Health
-# ---------------------------------------------------------------------------
-
 @app.get("/")
 async def root():
-    return {
-        "message": "SeatLock API is running"
-    }
+    return {"message": "SeatLock API is running"}
 
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok"
-    }
+    return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
-# Authentication
-# ---------------------------------------------------------------------------
-
-@app.post(
-    "/auth/login",
-    response_model=UserResponse,
-)
-async def login(
-    request: LoginRequest,
-    response: Response,
-    db: AsyncSession = Depends(get_db),
-):
-    user = await login_user(
-        email=request.email,
-        name=request.name,
-        response=response,
-        db=db,
-    )
-
-    return user
+@app.post("/auth/login", response_model=LoginResponse)
+async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
+    user, token = await login_user(request.name, request.email, db)
+    return {"token": token, "user": user}
 
 
-@app.get(
-    "/auth/me",
-    response_model=UserResponse,
-)
-async def me(
-    current_user: models.User = Depends(
-        get_current_user
-    ),
-):
+@app.get("/auth/me", response_model=UserResponse)
+async def me(current_user: models.User = Depends(get_current_user)):
     return current_user
 
 
 @app.post("/auth/logout")
 async def logout(
-    response: Response,
-    session_token: str | None = Cookie(
-        default=None
-    ),
-):
-    logout_user(
-        session_token,
-        response,
-    )
-
-    return {
-        "message": "Logout successful"
-    }
-
-
-# ---------------------------------------------------------------------------
-# Seats
-# ---------------------------------------------------------------------------
-
-@app.get(
-    "/seats",
-    response_model=list[SeatStateResponse],
-)
-async def get_seats(
+    authorization: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
 ):
-    seats_result = await db.execute(
-        select(models.Seat)
-        .order_by(models.Seat.seat_number)
-    )
+    if authorization and authorization.startswith("Bearer "):
+        await logout_user(authorization[7:].strip(), db)
+    return {"message": "Logged out"}
 
+
+@app.get("/seats", response_model=list[SeatStateResponse])
+async def get_seats(db: AsyncSession = Depends(get_db)):
+    await expire_holds_once()
+
+    seats_result = await db.execute(select(models.Seat).order_by(models.Seat.seat_number))
     seats = seats_result.scalars().all()
 
-
-    reservations_result = await db.execute(
-        select(models.Reservation)
-        .where(
+    active_result = await db.execute(
+        select(models.Reservation).where(
             models.Reservation.status.in_(
-                [
-                    models.ReservationStatus.HELD,
-                    models.ReservationStatus.CONFIRMED,
-                ]
+                [models.ReservationStatus.HELD, models.ReservationStatus.CONFIRMED]
             )
         )
     )
+    active = active_result.scalars().all()
+    by_seat = {reservation.seat_id: reservation for reservation in active}
 
-    reservations = (
-        reservations_result.scalars().all()
-    )
-
-
-    reservation_by_seat = {
-        reservation.seat_id: reservation
-        for reservation in reservations
-    }
-
-
-    response = []
-
-    for seat in seats:
-
-        reservation = reservation_by_seat.get(
-            seat.id
-        )
-
-        if reservation is None:
-
-            seat_status = "AVAILABLE"
-
-        else:
-
-            seat_status = (
-                reservation.status.value
-            )
+    return [
+        {
+            "id": seat.id,
+            "seat_number": seat.seat_number,
+            "status": by_seat[seat.id].status.value if seat.id in by_seat else "AVAILABLE",
+            "reservation_id": by_seat[seat.id].id if seat.id in by_seat else None,
+            "held_until": (
+                by_seat[seat.id].held_until
+                if seat.id in by_seat and by_seat[seat.id].status == models.ReservationStatus.HELD
+                else None
+            ),
+        }
+        for seat in seats
+    ]
 
 
-        response.append(
-            {
-                "id": seat.id,
-                "seat_number": seat.seat_number,
-                "status": seat_status,
-                "reservation_id": (
-                    reservation.id
-                    if reservation
-                    else None
-                ),
-                "held_until": (
-                    reservation.held_until
-                    if reservation
-                    and reservation.status
-                    == models.ReservationStatus.HELD
-                    else None
-                ),
-            }
-        )
+@app.get("/availability", response_model=AvailabilityResponse)
+async def availability(db: AsyncSession = Depends(get_db)):
+    await expire_holds_once()
 
-    return response
-
-
-# ---------------------------------------------------------------------------
-# Availability
-# ---------------------------------------------------------------------------
-
-@app.get(
-    "/availability",
-    response_model=AvailabilityResponse,
-)
-async def availability(
-    db: AsyncSession = Depends(get_db),
-):
-
-    total = (
+    total = int(await db.scalar(select(func.count(models.Seat.id))) or 0)
+    held = int(
         await db.scalar(
-            select(func.count(models.Seat.id))
-        )
-    )
-
-
-    held = (
-        await db.scalar(
-            select(
-                func.count(
-                    models.Reservation.id
-                )
-            ).where(
-                models.Reservation.status
-                == models.ReservationStatus.HELD
+            select(func.count(models.Reservation.id)).where(
+                models.Reservation.status == models.ReservationStatus.HELD
             )
         )
+        or 0
     )
-
-
-    confirmed = (
+    confirmed = int(
         await db.scalar(
-            select(
-                func.count(
-                    models.Reservation.id
-                )
-            ).where(
-                models.Reservation.status
-                == models.ReservationStatus.CONFIRMED
+            select(func.count(models.Reservation.id)).where(
+                models.Reservation.status == models.ReservationStatus.CONFIRMED
             )
         )
+        or 0
     )
-
-
-    total = int(total or 0)
-    held = int(held or 0)
-    confirmed = int(confirmed or 0)
-
-    available = (
-        total
-        - held
-        - confirmed
-    )
-
 
     return {
         "total": total,
-        "available": available,
+        "available": total - held - confirmed,
         "held": held,
         "confirmed": confirmed,
     }
 
 
-# ---------------------------------------------------------------------------
-# Reservation: hold
-# ---------------------------------------------------------------------------
-
-@app.post(
-    "/reservations/hold",
-    response_model=ReservationResponse,
-)
+@app.post("/reservations/hold", response_model=ReservationResponse)
 async def create_hold(
     request: HoldSeatRequest,
-    idempotency_key: str = Header(
-        ...,
-        alias="Idempotency-Key",
-        min_length=1,
-    ),
-    current_user: models.User = Depends(
-        get_current_user
-    ),
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1),
+    current_user: models.User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-
-    return await hold_seat(
-        db=db,
-        user=current_user,
-        seat_id=request.seat_id,
-        idempotency_key=idempotency_key,
-    )
+    return await hold_seat(db, current_user, request.seat_id, idempotency_key)
 
 
-# ---------------------------------------------------------------------------
-# Reservation: confirm
-# ---------------------------------------------------------------------------
-
-@app.post(
-    "/reservations/{reservation_id}/confirm",
-    response_model=ReservationResponse,
-)
+@app.post("/reservations/{reservation_id}/confirm", response_model=ReservationResponse)
 async def confirm(
     reservation_id: int,
-    idempotency_key: str = Header(
-        ...,
-        alias="Idempotency-Key",
-        min_length=1,
-    ),
-    current_user: models.User = Depends(
-        get_current_user
-    ),
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1),
+    current_user: models.User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-
     return await confirm_reservation(
-        db=db,
-        user=current_user,
-        reservation_id=reservation_id,
-        idempotency_key=idempotency_key,
+        db,
+        current_user,
+        reservation_id,
+        idempotency_key,
     )
 
 
-# ---------------------------------------------------------------------------
-# Reservation: cancel
-# ---------------------------------------------------------------------------
-
-@app.post(
-    "/reservations/{reservation_id}/cancel",
-    response_model=ReservationResponse,
-)
+@app.post("/reservations/{reservation_id}/cancel", response_model=ReservationResponse)
 async def cancel(
     reservation_id: int,
-    idempotency_key: str = Header(
-        ...,
-        alias="Idempotency-Key",
-        min_length=1,
-    ),
-    current_user: models.User = Depends(
-        get_current_user
-    ),
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1),
+    current_user: models.User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-
     return await cancel_reservation(
-        db=db,
-        user=current_user,
-        reservation_id=reservation_id,
-        idempotency_key=idempotency_key,
+        db,
+        current_user,
+        reservation_id,
+        idempotency_key,
     )
 
 
-# ---------------------------------------------------------------------------
-# Current user's reservation
-# ---------------------------------------------------------------------------
-
-@app.get(
-    "/reservations/me",
-    response_model=ReservationResponse | None,
-)
+@app.get("/reservations/me", response_model=ReservationResponse | None)
 async def my_reservation(
-    current_user: models.User = Depends(
-        get_current_user
-    ),
+    current_user: models.User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-
-    return await get_active_reservation_for_user(
-        db,
-        current_user.id,
-    )
+    await expire_holds_once()
+    return await get_active_reservation_for_user(db, current_user.id)
 
 
-# ---------------------------------------------------------------------------
-# Activity timeline
-# ---------------------------------------------------------------------------
-
-@app.get(
-    "/reservations/{reservation_id}/activity",
-    response_model=list[ActivityResponse],
-)
+@app.get("/reservations/{reservation_id}/activity", response_model=list[ActivityResponse])
 async def reservation_activity(
     reservation_id: int,
-    current_user: models.User = Depends(
-        get_current_user
-    ),
+    current_user: models.User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-
-    reservation_result = await db.execute(
-        select(models.Reservation)
-        .where(
-            models.Reservation.id
-            == reservation_id,
-            models.Reservation.user_id
-            == current_user.id,
+    owns = await db.scalar(
+        select(func.count(models.Reservation.id)).where(
+            models.Reservation.id == reservation_id,
+            models.Reservation.user_id == current_user.id,
         )
     )
-
-    reservation = (
-        reservation_result.scalar_one_or_none()
-    )
-
-    if reservation is None:
-        from fastapi import HTTPException
-
-        raise HTTPException(
-            status_code=404,
-            detail="Reservation not found",
-        )
-
+    if not owns:
+        raise HTTPException(status_code=404, detail="Reservation not found")
 
     result = await db.execute(
         select(models.ActivityLog)
-        .where(
-            models.ActivityLog.reservation_id
-            == reservation_id
-        )
-        .order_by(
-            models.ActivityLog.timestamp,
-            models.ActivityLog.id,
-        )
+        .where(models.ActivityLog.reservation_id == reservation_id)
+        .order_by(models.ActivityLog.timestamp, models.ActivityLog.id)
     )
-
     return result.scalars().all()
 
 
-# ---------------------------------------------------------------------------
-# Waitlist: join
-# ---------------------------------------------------------------------------
-
-@app.post(
-    "/waitlist/join",
-    response_model=WaitlistResponse,
-)
+@app.post("/waitlist/join", response_model=WaitlistResponse)
 async def waitlist_join(
-    idempotency_key: str = Header(
-        ...,
-        alias="Idempotency-Key",
-        min_length=1,
-    ),
-    current_user: models.User = Depends(
-        get_current_user
-    ),
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1),
+    current_user: models.User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-
-    return await join_waitlist(
-        db=db,
-        user=current_user,
-        idempotency_key=idempotency_key,
-    )
+    return await join_waitlist(db, current_user, idempotency_key)
 
 
-# ---------------------------------------------------------------------------
-# Waitlist: cancel
-# ---------------------------------------------------------------------------
-
-@app.post(
-    "/waitlist/{entry_id}/cancel",
-    response_model=WaitlistResponse,
-)
+@app.post("/waitlist/{entry_id}/cancel", response_model=WaitlistResponse)
 async def waitlist_cancel(
     entry_id: int,
-    idempotency_key: str = Header(
-        ...,
-        alias="Idempotency-Key",
-        min_length=1,
-    ),
-    current_user: models.User = Depends(
-        get_current_user
-    ),
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1),
+    current_user: models.User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-
     return await cancel_waitlist(
-        db=db,
-        user=current_user,
-        entry_id=entry_id,
-        idempotency_key=idempotency_key,
+        db,
+        current_user,
+        entry_id,
+        idempotency_key,
     )
 
 
-# ---------------------------------------------------------------------------
-# Current user's waitlist position
-# ---------------------------------------------------------------------------
-
-@app.get(
-    "/waitlist/me",
-    response_model=WaitlistStatusResponse,
-)
-async def my_waitlist_status(
-    current_user: models.User = Depends(
-        get_current_user
-    ),
+@app.get("/waitlist/me", response_model=WaitlistStatusResponse)
+async def my_waitlist(
+    current_user: models.User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-
-    entry = await get_active_waitlist_entry(
-        db,
-        current_user.id,
-    )
-
+    entry = await get_active_waitlist_entry(db, current_user.id)
     if entry is None:
-
-        return {
-            "entry": None,
-            "position": None,
-        }
-
-
-    position = await get_waitlist_position(
-        db,
-        entry,
-    )
+        return {"entry": None, "position": None}
 
     return {
         "entry": entry,
-        "position": position,
+        "position": await get_waitlist_position(db, entry),
     }
 
-
-# ---------------------------------------------------------------------------
-# WebSocket
-# ---------------------------------------------------------------------------
 
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
+    token: str = Query(...),
 ):
+    async with SessionLocal() as db:
+        user = await user_from_token(token, db)
 
-    await manager.connect(
-        websocket
-    )
+    if user is None:
+        await websocket.close(code=1008)
+        return
 
+    await manager.connect(websocket)
     try:
-
         while True:
-
             await websocket.receive_text()
-
     except WebSocketDisconnect:
-
-        manager.disconnect(
-            websocket
-        )
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)

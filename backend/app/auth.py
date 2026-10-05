@@ -1,88 +1,89 @@
-"""Simple server-side session authentication for SeatLock."""
-
 import secrets
+from datetime import timedelta
 
-from fastapi import Cookie, Depends, HTTPException, Response, status
+from fastapi import Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .database import get_db, settings
-from .models import User
+from .config import settings
+from .database import get_db
+from .models import AuthSession, User, utc_now
 
 
-# Recruitment/demo-grade server-side session store.
-# Run one backend worker so every request sees the same session map.
-sessions: dict[str, int] = {}
+async def login_user(name: str, email: str, db: AsyncSession) -> tuple[User, str]:
+    normalized_email = email.strip().lower()
 
-
-async def login_user(
-    email: str,
-    name: str,
-    response: Response,
-    db: AsyncSession,
-) -> User:
-    result = await db.execute(select(User).where(User.email == email))
+    result = await db.execute(select(User).where(User.email == normalized_email))
     user = result.scalar_one_or_none()
 
     if user is None:
-        user = User(name=name, email=email)
+        user = User(name=name.strip(), email=normalized_email)
         db.add(user)
         await db.flush()
     else:
-        user.name = name
+        user.name = name.strip()
 
+    token = secrets.token_urlsafe(48)
+    session = AuthSession(
+        token=token,
+        user_id=user.id,
+        expires_at=utc_now() + timedelta(days=settings.SESSION_DAYS),
+    )
+    db.add(session)
     await db.commit()
     await db.refresh(user)
-
-    session_token = secrets.token_urlsafe(32)
-    sessions[session_token] = user.id
-
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        samesite=settings.COOKIE_SAMESITE,
-        secure=settings.COOKIE_SECURE,
-        max_age=settings.SESSION_TTL_SECONDS,
-        path="/",
-    )
-    return user
+    return user, token
 
 
 async def get_current_user(
-    session_token: str | None = Cookie(default=None),
+    authorization: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    if session_token is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated",
-        )
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
-    user_id = sessions.get(session_token)
-    if user_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid session",
-        )
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User no longer exists",
-        )
+    result = await db.execute(
+        select(AuthSession, User)
+        .join(User, User.id == AuthSession.user_id)
+        .where(AuthSession.token == token)
+    )
+    row = result.first()
+
+    if row is None:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    session, user = row
+
+    if session.expires_at <= utc_now():
+        await db.delete(session)
+        await db.commit()
+        raise HTTPException(status_code=401, detail="Session expired")
+
     return user
 
 
-def logout_user(session_token: str | None, response: Response):
-    if session_token is not None:
-        sessions.pop(session_token, None)
+async def logout_user(token: str, db: AsyncSession) -> None:
+    result = await db.execute(select(AuthSession).where(AuthSession.token == token))
+    session = result.scalar_one_or_none()
+    if session is not None:
+        await db.delete(session)
+        await db.commit()
 
-    response.delete_cookie(
-        key="session_token",
-        path="/",
-        samesite=settings.COOKIE_SAMESITE,
-        secure=settings.COOKIE_SECURE,
+
+async def user_from_token(token: str, db: AsyncSession) -> User | None:
+    result = await db.execute(
+        select(AuthSession, User)
+        .join(User, User.id == AuthSession.user_id)
+        .where(AuthSession.token == token)
     )
+    row = result.first()
+    if row is None:
+        return None
+    session, user = row
+    if session.expires_at <= utc_now():
+        return None
+    return user
